@@ -1,0 +1,285 @@
+const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const compression = require('compression');
+const mongoose = require('mongoose');
+const path = require('path');
+const fs = require('fs');
+const cors = require('cors');
+require('dotenv').config();
+
+// Basic metadata
+const { version: APP_VERSION } = require('./package.json');
+const STARTED_AT = Date.now();
+const DISABLE_DB = (process.env.DISABLE_DB || '').toLowerCase() === 'true';
+let dbStatus = DISABLE_DB ? 'disabled' : 'initializing';
+
+// Initialize Express app
+const app = express();
+
+app.use(cors({ origin: 'https://chatbot-frontend-3r5b.onrender.com', methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
+app.options('*', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', 'https://chatbot-frontend-3r5b.onrender.com');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.sendStatus(204);
+}); // Pre-flight OPTIONS request handler
+// Ultra-permissive CORS (disabled restrictions): allows everything, no credentials
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// Basic middleware
+// Helmet security headers (we'll supply custom CSP below)
+app.use(helmet({
+  contentSecurityPolicy: false // disable helmet's default CSP so we can define dynamic one
+}));
+// Custom Content Security Policy to permit API calls to backend origin when frontend served statically
+app.use((req, res, next) => {
+  // Allow same-origin resources plus explicit backend API domain for fetch/XHR/WebSocket
+  const backendOrigin = process.env.BACKEND_PUBLIC_URL || 'https://college-rag-chatbot-backend.onrender.com';
+  // Derive websocket equivalent (wss) for connect-src
+  let backendWsOrigin = backendOrigin.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
+  const connectSrc = ["'self'", backendOrigin, backendWsOrigin].filter((v, i, a) => a.indexOf(v) === i).join(' ');
+  // You can expand img-src/media-src/fonts as needed later
+  const csp = [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval'", // CRA build may inline runtime; relax if you tighten later
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    `connect-src ${connectSrc}`,
+    "font-src 'self' data:",
+    "object-src 'none'",
+    "frame-ancestors 'self'",
+    "base-uri 'self'",
+    "form-action 'self'"
+  ].join('; ');
+  res.setHeader('Content-Security-Policy', csp);
+  next();
+});
+app.use(compression());
+
+// (Removed cors package and layered headers; using single permissive middleware above)
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
+  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use(limiter);
+
+// Body parsing middleware
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Static file serving (uploads)
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Create necessary directories
+const createDirectories = () => {
+  const dirs = [
+    path.join(__dirname, 'uploads'),
+    path.join(__dirname, 'logs'),
+    path.join(__dirname, 'data', 'vectors')
+  ];
+  
+  dirs.forEach(dir => {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+      console.log(`Created directory: ${dir}`);
+    }
+  });
+};
+
+// Database connection
+const connectDB = async () => {
+  if (DISABLE_DB) {
+    console.log('⚠️  Database explicitly disabled via DISABLE_DB=true');
+    dbStatus = 'disabled';
+    return;
+  }
+  try {
+    const mongoURI = process.env.MONGODB_URI || 'mongodb://localhost:27017/college-chatbot';
+    console.log('Attempting to connect to MongoDB...');
+    const conn = await mongoose.connect(mongoURI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true
+    });
+    dbStatus = 'connected';
+    console.log(`✅ MongoDB Connected: ${conn.connection.host}`);
+  } catch (error) {
+    dbStatus = 'error';
+    console.error('❌ MongoDB connection error (continuing without DB):', error.message);
+    console.log('Set DISABLE_DB=true to suppress connection attempts.');
+  }
+};
+
+// Initialize vector database
+const initializeVectorDB = async () => {
+  try {
+    console.log('🔧 Initializing vector database...');
+    
+    // Initialize local vector database service
+    const LocalVectorDatabaseService = require('./services/localVectorDatabase');
+    const vectorService = new LocalVectorDatabaseService();
+    await vectorService.initialize();
+    
+    console.log('✅ Vector database initialized');
+  } catch (error) {
+    console.error('❌ Vector database initialization error:', error.message);
+    console.log('📝 Note: Vector database will be created when first document is processed');
+    // Don't throw error, continue startup
+  }
+};
+
+// Health endpoints
+function buildHealth() {
+  const mongooseState = mongoose.connection.readyState === 1 ? 'connected' : (dbStatus === 'disabled' ? 'disabled' : dbStatus === 'error' ? 'disconnected' : 'connecting');
+  return {
+    status: 'OK',
+    version: APP_VERSION,
+    timestamp: new Date().toISOString(),
+    uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
+    database: mongooseState,
+    dbDisabled: DISABLE_DB,
+    env: process.env.NODE_ENV || 'development'
+  };
+}
+app.get('/health', (req, res) => res.json(buildHealth()));
+app.get('/api/health', (req, res) => res.json(buildHealth()));
+
+// API routes
+app.use('/api/auth', require('./routes/auth'));
+app.use('/api/chat', require('./routes/chat'));
+app.use('/api/admin', require('./routes/admin'));
+app.use('/api/whatsapp', require('./routes/whatsapp'));
+app.use('/api/scrape', require('./routes/scrape'));
+
+// Basic test endpoint
+app.get('/api/test', (req, res) => {
+  res.json({
+    message: 'College RAG Chatbot API is running!',
+    timestamp: new Date().toISOString(),
+    version: '1.0.0'
+  });
+});
+
+// Welcome endpoint
+app.get('/', (req, res) => {
+  res.json({
+    message: '🎓 Welcome to College RAG Chatbot API',
+    status: 'Server is running',
+    endpoints: {
+      health: '/health',
+      test: '/api/test',
+      auth: '/api/auth/*',
+      chat: '/api/chat/*',
+      admin: '/api/admin/*'
+    },
+    features: {
+      languages: ['Hindi', 'English', 'Marathi', 'Marwari', 'Mewadi', 'Dhundhari'],
+      capabilities: ['RAG Pipeline', 'Vector Search', 'WhatsApp Integration', 'Multilingual Support']
+    }
+  });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Error:', err.stack);
+  
+  res.status(err.status || 500).json({
+    error: {
+      message: process.env.NODE_ENV === 'development' ? err.message : 'Internal Server Error',
+      ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+    }
+  });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({
+    error: 'Endpoint not found',
+    available_endpoints: ['/health', '/api/test', '/api/auth', '/api/chat', '/api/admin']
+  });
+});
+
+// Initialize server
+const startServer = async () => {
+  try {
+    // Create directories
+    createDirectories();
+    
+    // Connect to database (with timeout)
+    console.log('🔌 Connecting to database...');
+    await Promise.race([
+      connectDB(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Database connection timeout')), 10000))
+    ]).catch(error => {
+      console.warn('⚠️ Database connection failed or timed out:', error.message);
+      console.log('💡 Continuing without database...');
+    });
+    
+    // Initialize vector database (with timeout)
+    console.log('🔧 Initializing vector database...');
+    await Promise.race([
+      initializeVectorDB(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Vector DB initialization timeout')), 5000))
+    ]).catch(error => {
+      console.warn('⚠️ Vector database initialization failed or timed out:', error.message);
+      console.log('💡 Vector database will be initialized when first needed...');
+    });
+    
+    // Start server
+    const PORT = process.env.PORT || 5000;
+    const HOST = process.env.HOST || 'localhost';
+    
+    app.listen(PORT, () => {
+      console.log('\n🚀 Backend Server Started');
+      console.log(`📍 http://${HOST}:${PORT}`);
+      console.log(`💻 NODE_ENV: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`🗄️  DB Status: ${buildHealth().database}`);
+      console.log(`🔧 DISABLE_DB=${DISABLE_DB}`);
+      console.log('🔍 Health: /health  |  /api/health');
+      console.log('✅ Server startup complete!');
+    });
+    
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+};
+
+// Handle graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Shutting down gracefully...');
+  mongoose.connection.close(() => {
+    console.log('MongoDB connection closed.');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT received. Shutting down gracefully...');
+  try {
+    await mongoose.connection.close();
+    console.log('MongoDB connection closed.');
+    process.exit(0);
+  } catch (error) {
+    console.error('Error closing MongoDB connection:', error);
+    process.exit(1);
+  }
+});
+
+// Start the server
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = { app, startServer };
