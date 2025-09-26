@@ -1,0 +1,60 @@
+# Development files
+.env.example
+.env.local
+.env.development
+.env.test
+*.log
+logs/
+
+# Test files
+test/
+tests/
+__tests__/
+*.test.js
+*.spec.js
+coverage/
+
+# Development dependencies
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+
+# Node modules (handled by package.json)
+node_modules/
+
+# Git files
+.git/
+.gitignore
+
+# Documentation (optional - remove if you want docs deployed)
+README.md
+docs/
+*.md
+
+# Development scripts
+dev-*
+test-*
+setup-*
+populate-*
+check-*
+comprehensive-*
+simple-*
+extract-*
+generate-*
+
+# Temporary uploads (will be recreated)
+uploads/*.pdf
+uploads/*.doc*
+uploads/*.txt
+
+# Large test files
+*.large
+*.dump
